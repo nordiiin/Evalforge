@@ -3,18 +3,22 @@
 A CLI that turns a Microsoft Copilot Studio solution export into a test set
 ready to upload to Copilot Studio's Agent Evaluation feature.
 
-> **Status:** Milestone 1. Parses a solution and prints a clean summary.
-> Generation, validation, and CSV writing land in later milestones — see
-> [`SPEC.md`](SPEC.md).
+> **Status:** Milestone 2. Parses a solution and generates happy-path test
+> cases via the Anthropic API, with on-disk response caching. Other modes,
+> OpenAI / Azure providers, and the validate / init commands land in M3 / M4.
+> See [`SPEC.md`](SPEC.md).
 
-## What's in M1
+## What's in the box
 
-- Parse a Copilot Studio `.zip` solution export, in-memory (no extraction).
-- Parse a directory of topic YAML files, for when you're iterating on extracted
-  topics.
-- Print a tabular summary of topics, knowledge sources, and tools.
-- Resolve references between topics and the knowledge sources / tools they call.
-- Filter system topics by default; opt them in with `--include-system`.
+- `evalforge inspect` — parse a `.zip` solution export or directory of topic
+  YAMLs and print rich tables of topics, knowledge sources, and tools.
+- `evalforge generate` — generate a Copilot Studio Agent Evaluation CSV.
+  Happy-path mode is implemented end-to-end against Anthropic's API; flags for
+  topic filtering, count, seed, dry-run, and cache control are wired up.
+- On-disk response cache — re-running the same command with the same seed
+  costs zero tokens.
+- LLM provider abstraction — Anthropic working; OpenAI and Azure stubbed
+  behind a clear `NotImplementedError` until M3.
 
 ## Install (dev)
 
@@ -23,6 +27,7 @@ git clone https://github.com/nordiiin/evalforge.git
 cd evalforge
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
+export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
 Once published, `pipx install evalforge` will be the supported install path.
@@ -30,50 +35,60 @@ Once published, `pipx install evalforge` will be the supported install path.
 ## Usage
 
 ```bash
-# Inspect a solution zip
+# Inspect what's in a solution
 evalforge inspect path/to/MySolution.zip
+evalforge inspect path/to/MySolution.zip --include-system --show-triggers
 
-# Inspect a directory of topic YAMLs
-evalforge inspect path/to/topics/
+# Generate test cases (happy-path mode)
+evalforge generate path/to/MySolution.zip -o test-set.csv --count 5
 
-# Include greeting / fallback / on-error topics in the table
-evalforge inspect path/to/MySolution.zip --include-system
+# Preview the LLM prompts without spending tokens
+evalforge generate path/to/MySolution.zip -o /tmp/x.csv --dry-run
 
-# Print every trigger phrase under each topic
-evalforge inspect path/to/MySolution.zip --show-triggers
+# Generate for specific topics only, with a seed for reproducibility
+evalforge generate path/to/MySolution.zip -o test-set.csv \
+    --topic "Order Status" --topic "Store Hours" \
+    --count 10 --seed 42
+
+# Bypass the cache (always re-generate)
+evalforge generate path/to/MySolution.zip -o test-set.csv --no-cache
+
+# Override the model (default is claude-opus-4-7)
+evalforge generate path/to/MySolution.zip -o test-set.csv \
+    --model claude-sonnet-4-6
 ```
 
-Sample output:
+## Working assumption: CSV column schema
 
-```
-Source: tests/fixtures/sample_solution
-Bot:    EvalForge Test Bot
+> ⚠️ The exact column schema for Copilot Studio Agent Evaluation imports
+> isn't in the public spec. M2 ships with the columns documented in
+> `src/evalforge/csv_writer.py` as a working assumption — please verify
+> against an actual Copilot Studio import (or paste the schema from the
+> `copilot-studio-eval` skill referenced in `SPEC.md` §5) before relying on
+> generated CSVs in production.
 
-Topics (3)
-┃ Name          ┃ Description                                   ┃ Triggers ┃ Knowledge ┃ Tools ┃
-│ Order Status  │ Looks up the latest status of a customer ...  │     3    │     0     │   1   │
-│ Product Info  │ Answers product questions using the catalog.  │     3    │     1     │   0   │
-│ Store Hours   │ Tells the user our store opening hours.       │     3    │     0     │   0   │
-
-Knowledge sources (1)
-│ Product Catalog │ SharePoint │ SharePoint site containing all product specs and pricing. │
-
-Tools (1)
-│ Orders Lookup │ AISkill │ Looks up the status of a customer order in the orders system. │
-```
+The four supported grader types are correct (`Compare meaning`, `Keyword
+match`, `General quality`, `Exact match`); only the column header names need
+confirmation.
 
 ## Tech choices
 
-These are pragmatic defaults. Swap them later if there's a real reason to.
+- **CLI:** [`typer`](https://typer.tiangolo.com/) + [`rich`](https://github.com/Textualize/rich).
+- **YAML:** [`pyyaml`](https://pyyaml.org/) — only `safe_load` is needed.
+- **LLM:** the official [`anthropic`](https://github.com/anthropics/anthropic-sdk-python) SDK.
+  Default model is `claude-opus-4-7` with adaptive thinking, `effort: medium`,
+  prompt caching on the system prompt, and strict tool-use for guaranteed
+  JSON-shape outputs.
+- **Build backend:** [`hatchling`](https://hatch.pypa.io/) with PEP 621
+  metadata and a `src/` layout.
+- **Tests:** [`pytest`](https://pytest.org/) — 60+ tests; LLM-free via a fake
+  provider injected at the orchestration boundary.
 
-- **CLI:** [`typer`](https://typer.tiangolo.com/) — gives us auto-generated
-  help, argument validation, and easy testing via `CliRunner`.
-- **Tables / output:** [`rich`](https://github.com/Textualize/rich).
-- **YAML:** [`pyyaml`](https://pyyaml.org/) — we only need `safe_load`, no
-  round-tripping.
-- **Build backend:** [`hatchling`](https://hatch.pypa.io/) — modern PEP 621
-  metadata, simple `src/` layout.
-- **Tests:** [`pytest`](https://pytest.org/).
+## Cache layout
+
+LLM responses are cached as JSON files keyed by SHA-256 of `(provider, model,
+mode, count, seed, topic-fingerprint)`. Default location is
+`~/.cache/evalforge/`; override with `--cache-dir` or `EVALFORGE_CACHE_DIR`.
 
 ## Running tests
 
