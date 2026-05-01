@@ -1,16 +1,10 @@
 """Anthropic provider — uses Claude with strict tool use for typed output.
 
-Key design choices, all from the claude-api skill:
-
-- Default model is `claude-opus-4-7`. Override via `--model`.
-- Adaptive thinking on (`thinking={"type": "adaptive"}`) and effort `medium`
-  — this is structured generation, so we want some reasoning but not the
-  full Opus xhigh budget.
-- Strict tool use (`strict: True`) on a forced `tool_choice` for guaranteed
-  schema compliance — never parse free text.
-- Prompt caching on the system prompt block. Tools render before system, so
-  this caches both tools and system together and the per-topic user message
-  is the only thing that varies.
+Defaults from the claude-api skill:
+- `claude-opus-4-7`, adaptive thinking, `effort: medium`.
+- Strict tool use with forced `tool_choice` for guaranteed schema compliance.
+- Prompt caching on the system prompt block (tools render before system, so
+  this caches both tools + system together; per-topic user message varies).
 - Streaming via `messages.stream()` and `get_final_message()` to avoid HTTP
   timeouts when adaptive thinking burns extra time.
 """
@@ -19,59 +13,12 @@ from __future__ import annotations
 
 import anthropic
 
-from evalforge.generation.prompt import HAPPY_PATH_SYSTEM, build_happy_path_prompt
+from evalforge.generation.modes import get_mode
+from evalforge.generation.prompt import build_user_message
 from evalforge.parser.models import KnowledgeSource, Tool, Topic
 from evalforge.providers.base import GeneratedCase
 
 DEFAULT_ANTHROPIC_MODEL = "claude-opus-4-7"
-TOOL_NAME = "submit_test_cases"
-
-_TOOL_DEFINITION: dict = {
-    "name": TOOL_NAME,
-    "description": "Submit the generated test cases for this topic.",
-    "strict": True,
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "test_cases": {
-                "type": "array",
-                "description": "The generated test cases. MUST contain exactly the requested count.",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "user_input": {
-                            "type": "string",
-                            "description": (
-                                "A realistic phrasing of the trigger intent in a "
-                                "user's voice. Avoid paraphrasing trigger phrases."
-                            ),
-                        },
-                        "expected_response": {
-                            "type": "string",
-                            "description": (
-                                "The response the agent should give to user_input. "
-                                "Align with the topic's message nodes when present, "
-                                "or with what the connected knowledge source / tool "
-                                "would produce."
-                            ),
-                        },
-                        "rationale": {
-                            "type": "string",
-                            "description": (
-                                "One short sentence on what variation this case "
-                                "tests (e.g. 'polite phrasing', 'partial info')."
-                            ),
-                        },
-                    },
-                    "required": ["user_input", "expected_response", "rationale"],
-                    "additionalProperties": False,
-                },
-            },
-        },
-        "required": ["test_cases"],
-        "additionalProperties": False,
-    },
-}
 
 
 class AnthropicProvider:
@@ -89,22 +36,31 @@ class AnthropicProvider:
         # Reads ANTHROPIC_API_KEY from env if api_key is None.
         self._client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
 
-    def generate_happy_path(
+    def generate(
         self,
         *,
+        mode_name: str,
         topic: Topic,
         knowledge_sources: list[KnowledgeSource],
         tools: list[Tool],
         count: int,
         seed: int | None,
     ) -> list[GeneratedCase]:
-        user_prompt = build_happy_path_prompt(
+        spec = get_mode(mode_name)
+        user_prompt = build_user_message(
             topic=topic,
             knowledge_sources=knowledge_sources,
             tools=tools,
             count=count,
             seed=seed,
+            mode_name=mode_name,
         )
+        tool_definition = {
+            "name": spec.tool_name,
+            "description": spec.tool_description,
+            "strict": True,
+            "input_schema": spec.schema,
+        }
         with self._client.messages.stream(
             model=self.model,
             max_tokens=16000,
@@ -113,29 +69,20 @@ class AnthropicProvider:
             system=[
                 {
                     "type": "text",
-                    "text": HAPPY_PATH_SYSTEM,
+                    "text": spec.system_prompt,
                     "cache_control": {"type": "ephemeral"},
                 }
             ],
-            tools=[_TOOL_DEFINITION],
-            tool_choice={"type": "tool", "name": TOOL_NAME},
+            tools=[tool_definition],
+            tool_choice={"type": "tool", "name": spec.tool_name},
             messages=[{"role": "user", "content": user_prompt}],
         ) as stream:
             message = stream.get_final_message()
 
         for block in message.content:
-            if block.type == "tool_use" and block.name == TOOL_NAME:
-                payload = block.input or {}
-                items = payload.get("test_cases") or []
-                return [
-                    GeneratedCase(
-                        user_input=str(item.get("user_input", "")).strip(),
-                        expected_response=str(item.get("expected_response", "")).strip(),
-                        rationale=str(item.get("rationale", "")).strip(),
-                    )
-                    for item in items
-                ]
+            if block.type == "tool_use" and block.name == spec.tool_name:
+                return spec.parse(block.input or {})
         raise RuntimeError(
-            f"Model did not call {TOOL_NAME!r} (stop_reason={message.stop_reason!r}). "
+            f"Model did not call {spec.tool_name!r} (stop_reason={message.stop_reason!r}). "
             "This usually means the request was refused or hit max_tokens."
         )

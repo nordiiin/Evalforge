@@ -12,15 +12,22 @@ from rich.table import Table
 from evalforge import __version__
 from evalforge.cache import ResponseCache, default_cache_dir
 from evalforge.csv_writer import write_csv
+from evalforge.generation.allocation import allocate
 from evalforge.generation.generator import (
     SUPPORTED_MODES,
     generate_for_topic,
     resolve_referenced,
 )
-from evalforge.generation.prompt import build_happy_path_prompt
+from evalforge.generation.prompt import build_user_message
 from evalforge.parser.models import Solution, Topic
 from evalforge.parser.solution import parse_input
 from evalforge.providers.factory import SUPPORTED_PROVIDERS, make_provider
+
+_PROVIDER_API_KEYS: dict[str, str] = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "azure": "AZURE_OPENAI_API_KEY",
+}
 
 app = typer.Typer(
     name="evalforge",
@@ -178,28 +185,38 @@ def generate(
     mode: str = typer.Option(
         "happy_path",
         "--mode",
-        help=f"Generation mode. Currently supported: {sorted(SUPPORTED_MODES)}.",
+        help=f"Generation mode. Supported: {sorted(SUPPORTED_MODES)}.",
     ),
     count: int = typer.Option(
         5,
         "--count",
         min=1,
-        help="Number of test cases to generate per topic.",
+        help="Number of test cases to generate per topic. For mixed mode this total is split 40/30/20/10.",
     ),
     seed: int = typer.Option(
         None,
         "--seed",
-        help="Seed for reproducible generation. Used in the cache key.",
+        help="Seed for reproducible generation. Used in the cache key (and natively by OpenAI/Azure).",
     ),
     provider: str = typer.Option(
         "anthropic",
         "--provider",
-        help=f"LLM provider. Working in M2: anthropic. Stubbed: openai, azure.",
+        help=f"LLM provider. One of: {', '.join(SUPPORTED_PROVIDERS)}.",
     ),
     model: str = typer.Option(
         None,
         "--model",
-        help="Provider model. Defaults to the provider's recommended model.",
+        help="Provider model (or Azure deployment name). Defaults to the provider's recommended model.",
+    ),
+    azure_endpoint: str = typer.Option(
+        None,
+        "--endpoint",
+        help="Azure OpenAI endpoint (e.g. https://my.openai.azure.com). Falls back to AZURE_OPENAI_ENDPOINT.",
+    ),
+    azure_api_version: str = typer.Option(
+        None,
+        "--api-version",
+        help="Azure OpenAI API version (e.g. 2024-08-01-preview). Falls back to OPENAI_API_VERSION.",
     ),
     topic_filter: list[str] = typer.Option(
         None,
@@ -229,13 +246,13 @@ def generate(
 ) -> None:
     """Generate a test set CSV from a Copilot Studio solution.
 
-    The CSV column schema is a working assumption — see csv_writer.py for the
-    note. Confirm the columns import cleanly before relying on production output.
+    The CSV column schema and multi-turn serialization are working assumptions —
+    see csv_writer.py and modes/multi_turn.py for the notes. Confirm both
+    against an actual Copilot Studio import before relying on production output.
     """
     if mode not in SUPPORTED_MODES:
         console.print(
-            f"[red]Mode {mode!r} is not implemented yet.[/red] "
-            f"M2 supports: {sorted(SUPPORTED_MODES)}. Other modes land in M3."
+            f"[red]Unknown mode {mode!r}.[/red] Supported: {sorted(SUPPORTED_MODES)}."
         )
         raise typer.Exit(code=2)
     if provider not in SUPPORTED_PROVIDERS:
@@ -267,16 +284,22 @@ def generate(
         _print_dry_run(solution, selected, mode=mode, count=count, seed=seed)
         return
 
-    if provider == "anthropic" and not os.environ.get("ANTHROPIC_API_KEY"):
+    expected_env = _PROVIDER_API_KEYS.get(provider)
+    if expected_env and not os.environ.get(expected_env):
         console.print(
-            "[red]ANTHROPIC_API_KEY is not set.[/red] "
+            f"[red]{expected_env} is not set.[/red] "
             "Export it before running generate, or pass --dry-run to preview without LLM calls."
         )
         raise typer.Exit(code=1)
 
     try:
-        llm = make_provider(provider, model=model)
-    except NotImplementedError as exc:
+        llm = make_provider(
+            provider,
+            model=model,
+            endpoint=azure_endpoint,
+            api_version=azure_api_version,
+        )
+    except (NotImplementedError, ValueError) as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=2) from exc
 
@@ -287,15 +310,23 @@ def generate(
         console.print(f"[dim]Cache directory: {resolved_cache_dir}[/dim]")
 
     all_cases = []
-    cached_count = 0
-    fresh_count = 0
+    cached_units = 0
+    fresh_units = 0
+    multi_turn_count = 0
     for topic in selected:
         knowledge_sources, tools = resolve_referenced(solution, topic)
-        console.print(
-            f"[bold]{topic.name}[/bold] — "
-            f"requesting {count} case(s) ({len(knowledge_sources)} KS, {len(tools)} tool(s))"
-        )
-        cases, was_cached = generate_for_topic(
+        if mode == "mixed":
+            split = ", ".join(f"{m}={n}" for m, n in allocate(count).items() if n)
+            console.print(
+                f"[bold]{topic.name}[/bold] — mixed split: {split} "
+                f"({len(knowledge_sources)} KS, {len(tools)} tool(s))"
+            )
+        else:
+            console.print(
+                f"[bold]{topic.name}[/bold] — "
+                f"requesting {count} {mode} case(s) ({len(knowledge_sources)} KS, {len(tools)} tool(s))"
+            )
+        cases, cache_hits = generate_for_topic(
             topic=topic,
             knowledge_sources=knowledge_sources,
             tools=tools,
@@ -306,12 +337,14 @@ def generate(
             cache=cache,
         )
         all_cases.extend(cases)
-        if was_cached:
-            cached_count += 1
-            console.print(f"  [dim]→ {len(cases)} case(s) from cache[/dim]")
-        else:
-            fresh_count += 1
-            console.print(f"  [green]→ {len(cases)} case(s) generated[/green]")
+        multi_turn_count += sum(1 for c in cases if c.is_multi_turn)
+        for sub_mode, was_cached in cache_hits.items():
+            if was_cached:
+                cached_units += 1
+                console.print(f"  [dim]→ {sub_mode}: from cache[/dim]")
+            else:
+                fresh_units += 1
+                console.print(f"  [green]→ {sub_mode}: generated[/green]")
 
     try:
         write_csv(output, all_cases)
@@ -323,8 +356,14 @@ def generate(
     console.print(
         f"[bold green]Wrote {len(all_cases)} case(s)[/bold green] across "
         f"{len(selected)} topic(s) to {output} "
-        f"({cached_count} cached, {fresh_count} fresh)"
+        f"({cached_units} cached, {fresh_units} fresh sub-runs)"
     )
+    if multi_turn_count:
+        console.print(
+            f"[yellow]⚠  {multi_turn_count} multi-turn case(s) written. "
+            "The CSV transcript serialization is a working assumption — "
+            "verify the format against Copilot Studio before importing.[/yellow]"
+        )
 
 
 def _select_topics(
@@ -354,19 +393,31 @@ def _print_dry_run(
     if solution.bot_name:
         console.print(f"[bold]Bot:[/bold]    {solution.bot_name}")
     console.print(f"[bold]Topics:[/bold]  {len(topics)}")
-    console.print()
+
+    if mode == "mixed":
+        split = ", ".join(f"{m}={n}" for m, n in allocate(count).items() if n)
+        console.print(f"[bold]Mixed split:[/bold] {split}")
+        sub_modes = [m for m, n in allocate(count).items() if n]
+    else:
+        sub_modes = [mode]
+
     for topic in topics:
         knowledge_sources, tools = resolve_referenced(solution, topic)
-        console.print(f"[bold cyan]── {topic.name} ──[/bold cyan]")
-        prompt = build_happy_path_prompt(
-            topic=topic,
-            knowledge_sources=knowledge_sources,
-            tools=tools,
-            count=count,
-            seed=seed,
-        )
-        console.print(prompt)
         console.print()
+        console.print(f"[bold cyan]── {topic.name} ──[/bold cyan]")
+        for sub in sub_modes:
+            sub_count = allocate(count)[sub] if mode == "mixed" else count
+            console.print(f"[dim]Sub-mode: {sub} ({sub_count} case(s))[/dim]")
+            prompt = build_user_message(
+                topic=topic,
+                knowledge_sources=knowledge_sources,
+                tools=tools,
+                count=sub_count,
+                seed=seed,
+                mode_name=sub,
+            )
+            console.print(prompt)
+            console.print()
 
 
 @app.command()

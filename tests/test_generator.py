@@ -8,8 +8,8 @@ from pathlib import Path
 import pytest
 
 from evalforge.cache import ResponseCache
-from evalforge.generation.grader import GRADER_COMPARE_MEANING
 from evalforge.generation.generator import generate_for_topic, resolve_referenced
+from evalforge.generation.grader import GRADER_COMPARE_MEANING
 from evalforge.parser.models import KnowledgeSource, Solution, Tool, Topic
 from evalforge.providers.base import GeneratedCase
 
@@ -18,17 +18,19 @@ from evalforge.providers.base import GeneratedCase
 class FakeProvider:
     name: str = "fake"
     model: str = "fake-model"
-    cases: list[GeneratedCase] = field(
+    cases_by_mode: dict = field(default_factory=dict)
+    default_cases: list = field(
         default_factory=lambda: [
-            GeneratedCase("q1", "a1", "r1"),
-            GeneratedCase("q2", "a2", "r2"),
+            GeneratedCase(user_input="q1", expected_response="a1", rationale="r1"),
+            GeneratedCase(user_input="q2", expected_response="a2", rationale="r2"),
         ]
     )
-    calls: int = 0
+    calls: list = field(default_factory=list)
 
-    def generate_happy_path(self, **kwargs) -> list[GeneratedCase]:
-        self.calls += 1
-        return list(self.cases)
+    def generate(self, *, mode_name: str, **kwargs) -> list[GeneratedCase]:
+        self.calls.append(mode_name)
+        cases = self.cases_by_mode.get(mode_name, self.default_cases)
+        return [GeneratedCase(**c.__dict__) for c in cases]
 
 
 def _topic(name: str = "T", **overrides) -> Topic:
@@ -49,7 +51,7 @@ def _topic(name: str = "T", **overrides) -> Topic:
 
 def test_generate_for_topic_returns_test_cases_with_default_grader():
     provider = FakeProvider()
-    cases, was_cached = generate_for_topic(
+    cases, hits = generate_for_topic(
         topic=_topic(),
         knowledge_sources=[],
         tools=[],
@@ -59,12 +61,11 @@ def test_generate_for_topic_returns_test_cases_with_default_grader():
         seed=None,
         cache=None,
     )
-    assert was_cached is False
+    assert hits == {"happy_path": False}
     assert len(cases) == 2
     assert all(c.grader == GRADER_COMPARE_MEANING for c in cases)
     assert all(c.mode == "happy_path" for c in cases)
-    assert all(c.topic_name == "T" for c in cases)
-    assert provider.calls == 1
+    assert provider.calls == ["happy_path"]
 
 
 def test_generate_for_topic_uses_cache_on_second_call(tmp_path: Path):
@@ -81,13 +82,12 @@ def test_generate_for_topic_uses_cache_on_second_call(tmp_path: Path):
         cache=cache,
     )
 
-    first, was_cached_first = generate_for_topic(**kwargs)
-    second, was_cached_second = generate_for_topic(**kwargs)
+    _, first_hits = generate_for_topic(**kwargs)
+    _, second_hits = generate_for_topic(**kwargs)
 
-    assert was_cached_first is False
-    assert was_cached_second is True
-    assert provider.calls == 1, "second call should hit the cache, not the provider"
-    assert [c.user_input for c in first] == [c.user_input for c in second]
+    assert first_hits == {"happy_path": False}
+    assert second_hits == {"happy_path": True}
+    assert provider.calls == ["happy_path"]
 
 
 def test_generate_for_topic_cache_invalidates_on_seed_change(tmp_path: Path):
@@ -102,34 +102,72 @@ def test_generate_for_topic_cache_invalidates_on_seed_change(tmp_path: Path):
         count=2,
         cache=cache,
     )
-
     generate_for_topic(**base, seed=1)
     generate_for_topic(**base, seed=2)
-    assert provider.calls == 2
+    assert provider.calls == ["happy_path", "happy_path"]
 
 
-def test_generate_for_topic_unsupported_mode_raises():
+def test_generate_for_topic_unknown_mode_raises():
     with pytest.raises(NotImplementedError):
         generate_for_topic(
             topic=_topic(),
             knowledge_sources=[],
             tools=[],
             provider=FakeProvider(),
-            mode="edge_case",
+            mode="never_heard_of_it",
             count=1,
             seed=None,
             cache=None,
         )
 
 
+def test_generate_mixed_invokes_all_four_modes():
+    provider = FakeProvider(
+        cases_by_mode={
+            mode: [GeneratedCase(user_input=f"{mode}-q", expected_response=f"{mode}-a")]
+            for mode in ("happy_path", "edge_case", "hallucination", "multi_turn")
+        },
+        default_cases=[GeneratedCase(user_input="q", expected_response="a")],
+    )
+    cases, hits = generate_for_topic(
+        topic=_topic(),
+        knowledge_sources=[],
+        tools=[],
+        provider=provider,
+        mode="mixed",
+        count=10,
+        seed=None,
+        cache=None,
+    )
+    # 40/30/20/10 split → 4/3/2/1, each mode returns one case in the fake.
+    assert sorted(provider.calls) == sorted(
+        ["happy_path", "edge_case", "hallucination", "multi_turn"]
+    )
+    seen_modes = {c.mode for c in cases}
+    assert seen_modes == {"happy_path", "edge_case", "hallucination", "multi_turn"}
+    assert set(hits) == {"happy_path", "edge_case", "hallucination", "multi_turn"}
+
+
+def test_generate_mixed_skips_zero_allocation_submodes():
+    provider = FakeProvider()
+    _, hits = generate_for_topic(
+        topic=_topic(),
+        knowledge_sources=[],
+        tools=[],
+        provider=provider,
+        mode="mixed",
+        count=1,  # 40/30/20/10 of 1 → only happy_path gets the slot
+        seed=None,
+        cache=None,
+    )
+    assert hits == {"happy_path": False}
+    assert provider.calls == ["happy_path"]
+
+
 def test_resolve_referenced_pulls_kss_and_tools_by_id():
     ks = KnowledgeSource(id="ks1", name="Catalog", kind="SharePoint")
     tool = Tool(id="tl1", name="Lookup")
-    solution = Solution(
-        topics=[],
-        knowledge_sources=[ks],
-        tools=[tool],
-    )
+    solution = Solution(topics=[], knowledge_sources=[ks], tools=[tool])
     topic = _topic(knowledge_source_ids=["ks1", "missing"], tool_ids=["tl1"])
     kss, tools = resolve_referenced(solution, topic)
     assert [k.name for k in kss] == ["Catalog"]

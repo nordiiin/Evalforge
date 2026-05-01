@@ -1,7 +1,7 @@
-"""Prompt construction for the happy-path generation mode.
+"""Build the per-topic user message and extract message-node text.
 
-The system prompt is frozen across all topics so it caches well — keep
-volatile content out of it. Per-topic context goes in the user message.
+The user message is the same shape across modes — what varies between modes
+is the SYSTEM prompt and tool schema, both owned by the mode registry.
 """
 
 from __future__ import annotations
@@ -13,50 +13,18 @@ import yaml
 
 from evalforge.parser.models import KnowledgeSource, Tool, Topic
 
-HAPPY_PATH_SYSTEM = """You generate test cases for Microsoft Copilot Studio Agent Evaluation.
 
-Each request describes ONE topic from a Copilot Studio bot. Your job is to
-produce realistic happy-path test cases for that topic — examples of what real
-users would say to invoke the topic, paired with the response the agent
-should give.
-
-Quality bar:
-
-1. Realistic phrasings, not paraphrases. Vary how the user expresses the
-   intent: short and curt, polite and formal, with extra context, with
-   typos, with partial information, framed as a statement vs. a question.
-   Do NOT simply rewrite the topic's trigger phrases with synonyms — that
-   produces tautological tests with no signal.
-
-2. Stay in scope. Each user input should clearly trigger THIS topic and not
-   a sibling topic. Avoid inputs that span multiple intents.
-
-3. Expected responses align with the topic's actual behavior. If the topic
-   has explicit message nodes (SendActivity activities), the expected
-   response should align with those messages. If the topic answers from a
-   knowledge source, write a plausible answer the source could provide.
-   If the topic invokes a tool / connector, describe the action the agent
-   would take or the kind of result it would return.
-
-4. Rationale. For each case, write a short note explaining what variation
-   it tests (e.g. "polite phrasing", "indirect framing", "typo tolerance",
-   "partial information").
-
-Submit your output via the `submit_test_cases` tool. Always submit exactly
-the number of cases requested — no more, no fewer.
-"""
-
-
-def build_happy_path_prompt(
+def build_user_message(
     *,
     topic: Topic,
     knowledge_sources: list[KnowledgeSource],
     tools: list[Tool],
     count: int,
     seed: int | None,
+    mode_name: str,
 ) -> str:
-    """Render the per-topic user message for happy-path generation."""
-    parts: list[str] = [f"# Topic: {topic.name}"]
+    """Render the per-topic user message. Identical structure across modes."""
+    parts: list[str] = [f"# Topic: {topic.name}", f"Mode: {mode_name}"]
     if topic.description:
         parts.append(f"\nDescription: {topic.description}")
 
@@ -84,7 +52,7 @@ def build_happy_path_prompt(
             parts.append(f"- {activity!r}")
 
     parts.append("\n## Task")
-    parts.append(f"Generate {count} happy-path test case(s) for this topic.")
+    parts.append(f"Generate {count} {mode_name} test case(s) for this topic.")
     if seed is not None:
         parts.append(
             f"\n(Generation seed: {seed}. Used for cache keying — this run "

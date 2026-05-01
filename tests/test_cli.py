@@ -82,7 +82,7 @@ def test_generate_dry_run_prints_prompts(sample_solution_dir: Path, tmp_path: Pa
     assert result.exit_code == 0, result.output
     assert "Dry run" in result.output
     assert "Store Hours" in result.output
-    assert "Generate 2 happy-path test case(s)" in result.output
+    assert "Generate 2 happy_path test case(s)" in result.output
     assert not out.exists(), "dry-run must not write the CSV"
 
 
@@ -123,7 +123,7 @@ def test_generate_unknown_provider_errors(sample_solution_dir: Path, tmp_path: P
     assert "Unknown provider" in result.output
 
 
-def test_generate_unsupported_mode_errors(sample_solution_dir: Path, tmp_path: Path):
+def test_generate_unknown_mode_errors(sample_solution_dir: Path, tmp_path: Path):
     result = runner.invoke(
         app,
         [
@@ -132,15 +132,64 @@ def test_generate_unsupported_mode_errors(sample_solution_dir: Path, tmp_path: P
             "-o",
             str(tmp_path / "x.csv"),
             "--mode",
-            "edge_case",
+            "never_heard_of_it",
             "--dry-run",
         ],
     )
     assert result.exit_code != 0
-    assert "not implemented" in result.output.lower()
+    assert "Unknown mode" in result.output
 
 
-def test_generate_missing_api_key_errors(
+def test_generate_dry_run_supports_each_single_turn_mode(
+    sample_solution_dir: Path, tmp_path: Path
+):
+    for mode in ("happy_path", "edge_case", "hallucination", "multi_turn"):
+        result = runner.invoke(
+            app,
+            [
+                "generate",
+                str(sample_solution_dir),
+                "-o",
+                str(tmp_path / f"{mode}.csv"),
+                "--mode",
+                mode,
+                "--dry-run",
+                "--count",
+                "1",
+                "--topic",
+                "Store Hours",
+            ],
+        )
+        assert result.exit_code == 0, f"{mode}: {result.output}"
+        assert f"Mode: {mode}" in result.output
+
+
+def test_generate_mixed_dry_run_shows_split(sample_solution_dir: Path, tmp_path: Path):
+    result = runner.invoke(
+        app,
+        [
+            "generate",
+            str(sample_solution_dir),
+            "-o",
+            str(tmp_path / "mix.csv"),
+            "--mode",
+            "mixed",
+            "--count",
+            "10",
+            "--dry-run",
+            "--topic",
+            "Store Hours",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Mixed split" in result.output
+    assert "happy_path=4" in result.output
+    assert "edge_case=3" in result.output
+    assert "hallucination=2" in result.output
+    assert "multi_turn=1" in result.output
+
+
+def test_generate_missing_anthropic_key_errors(
     sample_solution_dir: Path, tmp_path: Path, monkeypatch
 ):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
@@ -155,6 +204,46 @@ def test_generate_missing_api_key_errors(
     )
     assert result.exit_code != 0
     assert "ANTHROPIC_API_KEY" in result.output
+
+
+def test_generate_missing_openai_key_errors(
+    sample_solution_dir: Path, tmp_path: Path, monkeypatch
+):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    result = runner.invoke(
+        app,
+        [
+            "generate",
+            str(sample_solution_dir),
+            "-o",
+            str(tmp_path / "x.csv"),
+            "--provider",
+            "openai",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "OPENAI_API_KEY" in result.output
+
+
+def test_generate_missing_azure_key_errors(
+    sample_solution_dir: Path, tmp_path: Path, monkeypatch
+):
+    monkeypatch.delenv("AZURE_OPENAI_API_KEY", raising=False)
+    result = runner.invoke(
+        app,
+        [
+            "generate",
+            str(sample_solution_dir),
+            "-o",
+            str(tmp_path / "x.csv"),
+            "--provider",
+            "azure",
+            "--model",
+            "deploy",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "AZURE_OPENAI_API_KEY" in result.output
 
 
 def test_generate_no_topics_match_errors(sample_solution_dir: Path, tmp_path: Path):
