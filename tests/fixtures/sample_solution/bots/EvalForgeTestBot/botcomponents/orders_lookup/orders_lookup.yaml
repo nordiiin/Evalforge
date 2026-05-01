@@ -1,0 +1,4 @@
+kind: AISkill
+id: tool_orders_lookup
+displayName: Orders Lookup
+description: Looks up the status of a customer order in the orders system.

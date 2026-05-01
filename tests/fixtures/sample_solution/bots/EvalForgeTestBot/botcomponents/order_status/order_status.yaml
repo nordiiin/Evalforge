@@ -1,0 +1,17 @@
+kind: AdaptiveDialog
+id: topic_order_status
+displayName: Order Status
+description: Looks up the latest status of a customer order via the orders connector.
+beginDialog:
+  kind: OnRecognizedIntent
+  id: main
+  intent:
+    triggerQueries:
+      - Where is my order?
+      - Track my package
+      - What's the status of order 12345?
+  actions:
+    - kind: InvokeConnectorAction
+      id: invoke_orders
+      connectionReference: cr_orders
+      actionId: tool_orders_lookup

@@ -1,0 +1,16 @@
+kind: AdaptiveDialog
+id: topic_store_hours
+displayName: Store Hours
+description: Tells the user our store opening hours.
+beginDialog:
+  kind: OnRecognizedIntent
+  id: main
+  intent:
+    triggerQueries:
+      - When are you open?
+      - What are your store hours?
+      - Are you open on Sunday?
+  actions:
+    - kind: SendActivity
+      id: send_hours
+      activity: We are open Monday to Friday, 9am to 5pm. Closed on weekends.

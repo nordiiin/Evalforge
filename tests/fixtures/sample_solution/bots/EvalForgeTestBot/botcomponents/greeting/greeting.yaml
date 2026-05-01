@@ -1,0 +1,16 @@
+kind: AdaptiveDialog
+id: topic_greeting
+displayName: Greeting
+description: System greeting topic.
+beginDialog:
+  kind: OnRecognizedIntent
+  id: main
+  intent:
+    triggerQueries:
+      - hi
+      - hello
+      - hey there
+  actions:
+    - kind: SendActivity
+      id: greet
+      activity: Hello! How can I help you today?

@@ -1,0 +1,18 @@
+kind: AdaptiveDialog
+id: topic_product_info
+displayName: Product Info
+description: Answers product questions using the catalog knowledge source.
+beginDialog:
+  kind: OnRecognizedIntent
+  id: main
+  intent:
+    triggerQueries:
+      - Tell me about the X-100
+      - What features does the X-100 have?
+      - How much does the X-100 cost?
+  actions:
+    - kind: SearchAndSummarizeContent
+      id: search_catalog
+      knowledgeSources:
+        - ks_product_catalog
+      userInput: =System.Activity.Text

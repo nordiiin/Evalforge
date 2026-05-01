@@ -1,0 +1,5 @@
+kind: KnowledgeSource
+id: ks_product_catalog
+displayName: Product Catalog
+description: SharePoint site containing all product specs and pricing.
+knowledgeSourceType: SharePoint
